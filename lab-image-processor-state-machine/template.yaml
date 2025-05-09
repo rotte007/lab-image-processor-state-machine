@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: "AWS Step Functions Serverless Image Processing Workflow"
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: nodejs22.x
+    Architectures:
+      - x86_64
+    MemorySize: 128
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # Lambda Layer for Sharp (Image Processing Library)
+  SharpLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: nodejs-sharp-layer
+      Description: "Lambda Layer for Sharp Image Processing Library"
+      ContentUri: layers/nodejs-sharp-layer/layer_content.zip
+      CompatibleRuntimes:
+        - nodejs22.x
+      RetentionPolicy: Delete
+      CompatibleArchitectures:
+        - x86_64
+        - arm64
+
+  # Step Functions State Machine
+  ImageProcessorStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/image-processor.asl.yaml
+      DefinitionSubstitutions:
+        GetFileTypeLambdaArn: !GetAtt GetFileType.Arn
+        CopyFileLambdaArn: !GetAtt CopyFile.Arn
+        ResizeImageLambdaArn: !GetAtt ResizeImage.Arn
+        WriteToDynamoDBLambdaArn: !GetAtt WriteToDynamoDB.Arn
+        DeleteFileLambdaArn: !GetAtt DeleteFile.Arn
+      Policies:
+        - CloudWatchLogsFullAccess
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetFileType # Allow Step Functions to invoke getFileType Lambda
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CopyFile # Allow Step Functions to invoke copyFile Lambda
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ResizeImage # Allow Step Functions to invoke resizeImage Lambda
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WriteToDynamoDB # Allow Step Functions to invoke DynamoDB Lambda
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DeleteFile # Allow Step Functions to invoke deleteFile Lambda
+      Logging:
+        Level: "ALL" # Logs all execution details
+        IncludeExecutionData: true # Logs input/output data
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      Type: EXPRESS
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/vendedlogs/ImageProcessorStateMachine-Logs"
+
+  # DynamoDB Table to store image metadata
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: thumbnails
+      AttributeDefinitions:
+        - AttributeName: original
+          AttributeType: S
+      KeySchema:
+        - AttributeName: original
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  SourceS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "lab-s3-source-bucket-${AWS::AccountId}"
+      AccessControl: Private
+
+  DestinationS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "lab-s3-destination-bucket-${AWS::AccountId}"
+      AccessControl: Private
+
+  # Lambda Function: Invoke State Machine on S3 Upload
+  InvokeImageProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: invokeImageProcessor
+      CodeUri: functions/invokeImageProcessor/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: "states:StartExecution"
+              Resource: !Ref ImageProcessorStateMachine
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImageProcessorStateMachine
+      Events:
+        S3Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceS3Bucket
+            Events: s3:ObjectCreated:*
+
+  # Lambda Function: Get File Type
+  GetFileType:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: getFileType
+      CodeUri: functions/getFileType/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  # Lambda Function: Copy File to Destination Bucket
+  CopyFile:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: copyFile
+      CodeUri: functions/copyFile/
+      Handler: app.handler
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationS3Bucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+
+  # Lambda Function: Resize Image
+  ResizeImage:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: resizeImage
+      CodeUri: functions/resizeImage/
+      Handler: app.handler
+      Layers:
+        - !Ref SharpLayer
+      MemorySize: 256 # Increased for image processing
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationS3Bucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+
+  # Lambda Function: Write Image Metadata to DynamoDB
+  WriteToDynamoDB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: writeToDynamoDB
+      CodeUri: functions/writeToDynamoDB/
+      Handler: app.handler
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref ImageMetadataTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+
+  # Lambda Function: Delete Non-JPEG Files
+  DeleteFile:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: deleteFile
+      CodeUri: functions/deleteFile/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+
+Outputs:
+  ImageProcessorStateMachineArn:
+    Description: "Step Functions State Machine ARN"
+    Value: !Ref ImageProcessorStateMachine
+
+  InvokeImageProcessorLambda:
+    Description: "Lambda Function to Trigger Step Functions"
+    Value: !GetAtt InvokeImageProcessor.Arn

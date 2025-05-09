@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS Step Functions Serverless Image Processing Workflow
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: nodejs22.x
+    Architectures:
+    - x86_64
+    MemorySize: 128
+    LoggingConfig:
+      LogFormat: JSON
+Resources:
+  SharpLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: nodejs-sharp-layer
+      Description: Lambda Layer for Sharp Image Processing Library
+      ContentUri: ..\..\layers\nodejs-sharp-layer\layer_content.zip
+      CompatibleRuntimes:
+      - nodejs22.x
+      RetentionPolicy: Delete
+      CompatibleArchitectures:
+      - x86_64
+      - arm64
+  ImageProcessorStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: ..\..\statemachine\image-processor.asl.yaml
+      DefinitionSubstitutions:
+        GetFileTypeLambdaArn:
+          Fn::GetAtt:
+          - GetFileType
+          - Arn
+        CopyFileLambdaArn:
+          Fn::GetAtt:
+          - CopyFile
+          - Arn
+        ResizeImageLambdaArn:
+          Fn::GetAtt:
+          - ResizeImage
+          - Arn
+        WriteToDynamoDBLambdaArn:
+          Fn::GetAtt:
+          - WriteToDynamoDB
+          - Arn
+        DeleteFileLambdaArn:
+          Fn::GetAtt:
+          - DeleteFile
+          - Arn
+      Policies:
+      - CloudWatchLogsFullAccess
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: GetFileType
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: CopyFile
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: ResizeImage
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: WriteToDynamoDB
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: DeleteFile
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+        - CloudWatchLogsLogGroup:
+            LogGroupArn:
+              Fn::GetAtt:
+              - StepFunctionsLogGroup
+              - Arn
+      Type: EXPRESS
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/ImageProcessorStateMachine-Logs
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: thumbnails
+      AttributeDefinitions:
+      - AttributeName: original
+        AttributeType: S
+      KeySchema:
+      - AttributeName: original
+        KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+  SourceS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName:
+        Fn::Sub: lab-s3-source-bucket-${AWS::AccountId}
+      AccessControl: Private
+  DestinationS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName:
+        Fn::Sub: lab-s3-destination-bucket-${AWS::AccountId}
+      AccessControl: Private
+  InvokeImageProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: invokeImageProcessor
+      CodeUri: InvokeImageProcessor
+      Handler: app.handler
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: states:StartExecution
+          Resource:
+            Ref: ImageProcessorStateMachine
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN:
+            Ref: ImageProcessorStateMachine
+      Events:
+        S3Trigger:
+          Type: S3
+          Properties:
+            Bucket:
+              Ref: SourceS3Bucket
+            Events: s3:ObjectCreated:*
+    Metadata:
+      SamResourceId: InvokeImageProcessor
+  GetFileType:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: getFileType
+      CodeUri: GetFileType
+      Handler: app.handler
+      Policies:
+      - AWSLambdaBasicExecutionRole
+    Metadata:
+      SamResourceId: GetFileType
+  CopyFile:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: copyFile
+      CodeUri: CopyFile
+      Handler: app.handler
+      Environment:
+        Variables:
+          DESTINATION_BUCKET:
+            Ref: DestinationS3Bucket
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - AmazonS3FullAccess
+    Metadata:
+      SamResourceId: CopyFile
+  ResizeImage:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: resizeImage
+      CodeUri: ResizeImage
+      Handler: app.handler
+      Layers:
+      - Ref: SharpLayer
+      MemorySize: 256
+      Environment:
+        Variables:
+          DESTINATION_BUCKET:
+            Ref: DestinationS3Bucket
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - AmazonS3FullAccess
+    Metadata:
+      SamResourceId: ResizeImage
+  WriteToDynamoDB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: writeToDynamoDB
+      CodeUri: WriteToDynamoDB
+      Handler: app.handler
+      Environment:
+        Variables:
+          DDB_TABLE_NAME:
+            Ref: ImageMetadataTable
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - AmazonDynamoDBFullAccess
+    Metadata:
+      SamResourceId: WriteToDynamoDB
+  DeleteFile:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: deleteFile
+      CodeUri: DeleteFile
+      Handler: app.handler
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - AmazonS3FullAccess
+    Metadata:
+      SamResourceId: DeleteFile
+Outputs:
+  ImageProcessorStateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value:
+      Ref: ImageProcessorStateMachine
+  InvokeImageProcessorLambda:
+    Description: Lambda Function to Trigger Step Functions
+    Value:
+      Fn::GetAtt:
+      - InvokeImageProcessor
+      - Arn
